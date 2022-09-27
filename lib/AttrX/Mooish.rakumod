@@ -17,9 +17,7 @@ CHECK {
         $*RAKU.compiler.version >= v2021.12.176.ga.38.bebecf ?? (400, 800, 1000) !! (4, 8, 10);
 }
 
-class X::Fatal is Exception {
-    #has Str $.message is rw;
-}
+class X::Fatal is Exception { }
 
 class X::TypeCheck::MooishOption is X::TypeCheck {
     has @.expected is required;
@@ -45,12 +43,33 @@ class X::NoNatives is X::Fatal {
     }
 }
 
+class X::Option::Name is X::Fatal {
+    has Str:D $.option is required;
+    method message {
+        "Unknown named option '$.option'"
+    }
+}
+
+class X::Option::Type is X::Fatal {
+    has Mu $.type is required;
+    method message {
+        "Trait 'mooish' only takes options as Pairs, but a {$.type.^name} encountered"
+    }
+}
+
+class X::HelperMethod is X::Fatal {
+    has Str:D $.helper is required;
+    has Str:D $.helper-name is required;
+    method message {
+        "Cannot install {$.helper}: a method with name '$.helper-name' is already defined"
+    }
+}
+
 my class AttrProxy is Proxy {
     has Mu $.val;
-    has Bool $.is-set is rw is default(False);
-    has Bool $.mooished is default(False);
-    has Promise $!built-promise;
-    has $.attribute;
+    has Bool $!is-set is default(False);
+    has $!built-promise;
+    has $!attribute is built(:bind);
     has $.instance;
 
     method !SET-SELF(%attrinit) is raw {
@@ -64,47 +83,46 @@ my class AttrProxy is Proxy {
     }
 
     method clear {
+        return if self.VAR.is-building;
         cas $!is-set, {
             if $_ {
                 $!val := Nil;
-                $!built-promise = Nil;
+                $!built-promise ⚛= Nil;
             }
             False
         }
     }
 
     method build-acquire {
-        return False if $!is-set;
-        my $bp = $!built-promise;
-        if !$bp.defined && cas($!built-promise, $bp, Promise.new) === $bp {
+        return False if ⚛$!is-set;
+        my $bp = my $bp-old = $!built-promise;
+        if !$bp-old.defined && ($bp = cas($!built-promise, $bp-old, Promise.new)) === $bp-old {
             return True;
         }
-        await $!built-promise;
+        await $bp;
         False
     }
 
     method build-release {
-        $!built-promise.keep(True);
+        (⚛$!built-promise).keep;
     }
 
+    method is-set { ⚛$!is-set }
+
     method is-building {
-        ? (.status ~~ Planned with $!built-promise);
+        ? (.status ~~ Planned with ⚛$!built-promise);
     }
 
     method store-value(Mu $value is raw) is raw is hidden-from-backtrace {
-        unless $!is-set {
+        unless ⚛$!is-set {
             $!val := nqp::clone_nd($!attribute.auto_viv_container);
-            $!is-set = True;
+            $!is-set ⚛= True;
         }
         nqp::if(
-            nqp::istype_nd($!val, Scalar),
+            nqp::iscont($!val),
             ($!val = $value),
             ($!val.STORE($value)));
         $!attribute.unbind-proxy($!instance, $!val)
-    }
-
-    method now-mooished {
-        $!mooished = True
     }
 }
 
@@ -117,8 +135,11 @@ my class AttrProxy is Proxy {
 enum PvtMode <pvmForce pvmNever pvmAsAttr pvmAuto>;
 
 role AttrXMooishHelper {
-    method setup-helpers ( Mu \type, $attr ) is hidden-from-backtrace {
+    method setup-helpers(Mu \type, $attr) is hidden-from-backtrace {
         my sub get-attr-obj( Mu \obj, $attr ) is raw is hidden-from-backtrace {
+            # Can't use $attr to call bind-proxy upon if the original attribute belongs to a role. In this case its
+            # .package is not defined.
+            # Metamodel::GenericHOW only happens for role attributes
             $attr.package.HOW ~~ Metamodel::GenericHOW
                 ?? (
                     ( try { obj.^get_attribute_for_usage($attr.name) } )
@@ -127,32 +148,27 @@ role AttrXMooishHelper {
                 !! $attr;
         }
         my %helpers =
-            :clearer( my method () is hidden-from-backtrace {
-                # Can't use $attr to call bind-proxy upon if the original attribute belongs to a role. In this case its
-                # .package is not defined.
-                # Metamodel::GenericHOW only happens for role attributes
-                my $attr-obj = get-attr-obj(self, $attr);
-                my Mu $attr-var := $attr-obj.bind-proxy(self, $attr-obj.package);
-                $attr-obj.clear-attr(self);
-                $attr-var.VAR.now-mooished;
-             } ),
-            :predicate( my method () is hidden-from-backtrace { get-attr-obj(self, $attr).is-set( self ) } ),
+            :clearer( anon method () is hidden-from-backtrace { get-attr-obj(self, $attr).clear-attr(self) } ),
+            :predicate( anon method () is hidden-from-backtrace { get-attr-obj(self, $attr).is-set( self ) } ),
             ;
 
         my @aliases = $attr.base-name, |$attr.init-args;
 
+        my $is-public := $attr.has_accessor;
         for %helpers.keys -> $helper {
             next unless $attr."$helper"(); # Don't generate if attribute isn't set
             for @aliases -> $base-name {
                 my $helper-name = $attr.opt2method( $helper, :$base-name  );
 
-                X::Fatal.new( message => "Cannot install {$helper} {$helper-name}: method already defined").throw
-                    if type.^declares_method( $helper-name );
+                X::HelperMethod.new( :$helper, :$helper-name ).throw
+                    if $is-public
+                        ?? type.^declares_method($helper-name)
+                        !! type.^find_private_method($helper-name);
 
                 my $m = %helpers{$helper};
                 $m.set_name( $helper-name );
 
-                if $attr.has_accessor { # I.e. – public?
+                if $is-public {
                     type.^add_method( $helper-name, $m );
                 } else {
                     type.^add_private_method( $helper-name, $m );
@@ -176,6 +192,7 @@ my role AttrXMooishAttributeHOW {
     has @.init-args;
     has $!has-build-closure = False;
     has $.phony-required = False;
+    has $!lock is built(:bind) = Lock.new;
 
     my %opt2prefix = clearer => 'clear',
                      predicate => 'has',
@@ -235,13 +252,13 @@ my role AttrXMooishAttributeHOW {
                     @!init-args.append: $value<>;
                 }
                 default {
-                    X::Fatal.new( message => "Unknown named option {$_}" ).throw;
+                    X::Option::Name.new( :option($_) ).throw
                 }
             }
         }
 
         multi sub set-option(Mu $opt) {
-            X::Fatal.new( message => "Trait 'mooish' only takes options as Pairs, not an {$opt.^name}" ).throw;
+            X::Option::Type.new( :type($opt.WHAT) ).throw
         }
 
         set-option($_) for @opt-list;
@@ -265,7 +282,7 @@ my role AttrXMooishAttributeHOW {
         nextsame
     }
 
-    method compose ( Mu \type, :$compiler_services ) is hidden-from-backtrace {
+    method compose(Mu \type, :$compiler_services) is hidden-from-backtrace {
         return if try nqp::getattr_i(self, Attribute, '$!composed');
 
         $!always-proxy = $!filter || $!trigger;
@@ -286,7 +303,7 @@ my role AttrXMooishAttributeHOW {
         self.invoke-composer( type );
     }
 
-    method make-mooish ( Mu $instance is raw, Mu $type is raw, %attrinit ) is hidden-from-backtrace {
+    method make-mooish(Mu $instance is raw, Mu $type is raw, %attrinit) is hidden-from-backtrace {
         my Mu $attr-var := self.get_value($instance);
 
         return if nqp::istype_nd($attr-var, AttrProxy);
@@ -335,58 +352,73 @@ my role AttrXMooishAttributeHOW {
         if $initialized && !$!always-proxy {
             # No need to bind proxy when there is default value and no filter or trigger set.
             nqp::if(
-                nqp::istype_nd($attr-var, Scalar),
+                nqp::iscont($attr-var),
                 ($attr-var = $init-value),
                 ($attr-var.STORE($init-value)));
         }
         else {
-            $attr-var := self.bind-proxy($instance, $type);
+            my $attr-var := self.attr-var: $instance, :$type, :proxify;
             self.store-with-cb( $instance, $attr-var, $init-value, \( :$constructor ) )
                 if $initialized;
-            $attr-var.VAR.now-mooished;
         }
 
     }
 
-    method bind-proxy(Mu $instance is raw, Mu $type is raw) is raw is hidden-from-backtrace {
-        my Mu $attr-var := self.get_value($instance);
-        nqp::if(
-            nqp::istype_nd($attr-var, AttrProxy),
-            $attr-var,
-            nqp::bindattr(nqp::decont($instance), $type, $.name,
-                AttrProxy.new(
-                    :attribute(self),
-                    :$instance,
-                    FETCH => my sub ($proxy) is hidden-from-backtrace {
-#                        note "... FETCH from ", $.name, ", lazy? ", $!lazy;
-                        my $attr-var := nqp::decont($proxy);
-                        my Mu $val;
+    my class NO-VALUE-YET {}
+    method attr-var( Mu $instance is raw,
+                     &code?,
+                     Mu :$type is raw = self.package,
+                     Bool :$proxify
+                    ) is raw is hidden-from-backtrace
+    {
+        my Mu $attr-var;
+        my Mu $rc;
 
-                        if !$attr-var.VAR.is-set {
-#                            note "  . proxy value is not set yet";
-                            if $!lazy && $attr-var.VAR.build-acquire {
-                                LEAVE $attr-var.VAR.build-release;
-#                                note "    . try build attr";
-                                $val := self.build-attr( $instance, $attr-var );
-                            }
-                            else {
-#                                note "    . build has been acquired already";
-                                $val := nqp::clone_nd(self.auto_viv_container);
-                            }
-                        }
-                        else {
-#                            note "    . get value";
-                            $val := $attr-var.VAR.val;
-                        }
+        nqp::lock($!lock);
+        CATCH { nqp::unlock($!lock); .rethrow }
 
-                        $val
-                    },
-                    STORE => my sub ($proxy, Mu $value is raw) is hidden-from-backtrace {
-                        self.store-with-cb( $instance, nqp::decont($proxy), $value );
-                    })))
+        $attr-var := self.get_value($instance);
+        # Don't let the newly created proxy to .sink
+        my $ :=
+            nqp::unless(
+                (nqp::istype_nd($attr-var, AttrProxy) || !$proxify),
+                nqp::bindattr(nqp::decont($instance), $type, $.name,
+                    ($attr-var := AttrProxy.new(
+                        :attribute(self),
+                        :$instance,
+                        FETCH => my sub ($proxy) is raw is hidden-from-backtrace {
+                            my $attr-var := nqp::decont($proxy);
+                            my Mu $val := NO-VALUE-YET;
+
+                            if !$attr-var.VAR.is-set {
+                                if $!lazy {
+                                    if $attr-var.VAR.build-acquire {
+                                        LEAVE $attr-var.VAR.build-release;
+                                        $val := self.build-attr($instance, $attr-var);
+                                    }
+                                }
+                                else {
+                                    $val := nqp::clone_nd(self.auto_viv_container);
+                                }
+                            }
+
+                            if $val =:= NO-VALUE-YET {
+                                $val := $attr-var.VAR.val;
+                            }
+
+                            $val
+                        },
+                        STORE => my sub ($proxy, Mu $value is raw) is hidden-from-backtrace {
+                            self.store-with-cb( $instance, nqp::decont($proxy), $value );
+                        }))));
+        with &code { $rc := &code($attr-var) }
+
+        nqp::unlock($!lock);
+        
+        &code ?? $rc !! $attr-var
     }
 
-    method unbind-proxy ( Mu $instance is raw, Mu $val is raw ) is raw is hidden-from-backtrace {
+    method unbind-proxy(Mu $instance is raw, Mu $val is raw) is hidden-from-backtrace {
         my $attr-var := self.get_value($instance);
         unless $!always-proxy or !nqp::istype_nd($attr-var, AttrProxy) {
             self.set_value($instance, $val);
@@ -407,32 +439,32 @@ my role AttrXMooishAttributeHOW {
         $rval
     }
 
-    method is-set ( Mu \obj ) is hidden-from-backtrace {
+    method is-set(Mu \obj) is hidden-from-backtrace {
         my $attr-var := self.get_value(obj);
-        nqp::if(
+        my $rc := nqp::if(
             nqp::istype_nd($attr-var, AttrProxy),
-            $attr-var.VAR.is-set,
-            True)
+            nqp::getattr($attr-var, AttrProxy, '$!is-set'),
+            True);
+        $rc
     }
 
-    method clear-attr ( Mu \obj --> Nil ) is hidden-from-backtrace {
-        my $attr-var := self.get_value(obj);
-        X::NotAllowed.new(:op('clear'), :cause("attribute " ~ $.name ~ " is still building")).throw
-            if $attr-var.VAR.is-building;
+    method clear-attr(Mu \obj --> Nil) is hidden-from-backtrace {
+        my $attr-var := self.attr-var: obj, :proxify;
         nqp::if(nqp::istype_nd($attr-var, AttrProxy), $attr-var.VAR.clear);
     }
 
-    method invoke-filter ( Mu \instance, Mu $value is raw, Capture:D $params = \() ) is raw is hidden-from-backtrace {
+    method invoke-filter(Mu \instance, Mu $value is raw, Capture:D $params = \()) is raw is hidden-from-backtrace {
         $!filter
             ?? self.invoke-opt( instance, 'filter', \($value, |$params), :strict )
             !! $value
     }
 
-    method invoke-opt ( Mu $invocant,
-                        Str $option,
-                        Capture:D $params = \(),
-                        :$strict = False,
-                        PvtMode :$private is copy = pvmAuto ) is raw is hidden-from-backtrace
+    method invoke-opt( Mu $invocant,
+                       Str $option,
+                       Capture:D $params = \(),
+                       :$strict = False,
+                       PvtMode :$private is copy = pvmAuto
+                      ) is raw is hidden-from-backtrace
     {
         my $opt-value = self."$option"();
         my \type = nqp::decont($.package);
@@ -493,13 +525,13 @@ my role AttrXMooishAttributeHOW {
         $invocant.$method(|$invoke-params)
     }
 
-    method build-attr ( Mu $instance is raw, Mu $attr-var is raw ) is raw is hidden-from-backtrace {
+    method build-attr(Mu $instance is raw, Mu $attr-var is raw) is raw is hidden-from-backtrace {
         my Mu $val := self.invoke-opt( $instance, 'builder', :strict );
 #        note "= built value: ", $val.WHICH;
         self.store-with-cb( $instance, $attr-var, $val, \( :builder ) )
     }
 
-    method invoke-composer ( Mu \type ) is hidden-from-backtrace {
+    method invoke-composer(Mu \type) is hidden-from-backtrace {
         return unless $!composer;
         my $comp-name = self.opt2method( 'composer' );
         my &composer = type.^find_private_method( $comp-name );
@@ -510,7 +542,7 @@ my role AttrXMooishAttributeHOW {
 }
 
 role AttrXMooishClassHOW does AttrXMooishHelper {
-    method compose (Mu \type, :$compiler_services) is hidden-from-backtrace {
+    method compose(Mu \type, :$compiler_services) is hidden-from-backtrace {
         for type.^attributes.grep(AttrXMooishAttributeHOW) -> $attr {
             self.setup-helpers(type, $attr);
         }
@@ -570,6 +602,7 @@ role AttrXMooishClassHOW does AttrXMooishHelper {
                 nqp::push(newplan, $task) unless @candidates;
             }
             else {
+                %seen-attr{@mooified.map(*.name)} = @mooified;
                 @candidates.append: @mooified;
                 @mooified = ();
             }
@@ -588,11 +621,11 @@ role AttrXMooishClassHOW does AttrXMooishHelper {
         }
         nqp::bindattr(self, Metamodel::ClassHOW, '@!BUILDPLAN', newplan);
 
-        # Now collect @!BUILDALLPLAN. This part's logic is largerly copied from Rakudo's Perl6::Metamodel::BUILDPLAN
+        # Now collect @!BUILDALLPLAN. This part's logic is largely copied from Rakudo's Perl6::Metamodel::BUILDPLAN
 #        note "--- ALL PLAN for ", type.^name;
         my $allplan := nqp::create(nqp::what(plan));
         my $noops = False;
-        for type.^mro -> Mu $mro_class is raw {
+        for type.^mro.reverse -> Mu $mro_class is raw {
             my Mu $mro_plan := nqp::getattr($mro_class.HOW, Metamodel::ClassHOW, '@!BUILDPLAN');
             my $i = 0;
             my int $count = nqp::elems($mro_plan);
@@ -622,7 +655,7 @@ role AttrXMooishClassHOW does AttrXMooishHelper {
 }
 
 role AttrXMooishRoleHOW does AttrXMooishHelper {
-    method compose (Mu \type, :$compiler_services ) is hidden-from-backtrace {
+    method compose(Mu \type, :compiler_services($)) is hidden-from-backtrace {
         for type.^attributes.grep( AttrXMooishAttributeHOW ) -> $attr {
             self.setup-helpers(type, $attr);
         }
@@ -671,4 +704,4 @@ our sub META6 {
 #
 # Check the LICENSE file for the license
 
-# vim: tw=120 ft=perl6
+# vim: tw=120 ft=raku

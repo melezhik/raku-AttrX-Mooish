@@ -1,6 +1,43 @@
 =begin pod
 =CHANGELOG
 
+=head v0.8.10
+
+=item Fix accidental early initialization of lazy attributes on older Rakudo versions
+
+=head v0.8.9
+
+=item Clearer method would not throw anymore if attribute is still building. It would be just a NOP then.
+
+=head v0.8.8
+
+=item Resolve some more rare race conditions
+
+=head v0.8.7
+
+=item Fix private attribute helper methods checked for duplicate names in public method tables
+=item Fix definite-typed private lazy attributes
+
+=head v0.8.6
+
+=item Slightly improve thread-safety
+
+=head2 v0.8.5
+
+=item Make clearer method thread-safe
+
+=head2 v0.8.4
+
+=item Tidy up exceptions
+
+=head2 v0.8.3
+
+=item Fix incorrect handling of uninitialized lazy attributes in concurrent environment
+
+=head2 v0.8.2
+
+=item Fix a bug with the order of C<TWEAK> invocation for inherited classes
+
 =head2 v0.8.1
 
 =item Make it possible to have definite lazy attributes like:
