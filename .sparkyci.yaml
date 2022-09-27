@@ -1,0 +1,5 @@
+main:
+ with-zef-deps: true
+ with-license-check: true
+ with-code-coverage: true
+ 
